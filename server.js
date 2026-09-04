@@ -1373,7 +1373,7 @@ app.post('/customers', async (req, res) => {
         
         const query = `INSERT INTO customers (name, phone) VALUES ($1, $2) RETURNING *`;
         const values = [name, phone || null];
-        const result = await pool.query(query, values);
+        const result = await db.query(query, values);
         
         res.status(201).json(result.rows[0]);
     } catch (err) {
