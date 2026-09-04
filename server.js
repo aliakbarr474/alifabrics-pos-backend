@@ -515,6 +515,7 @@ app.get('/get-vendors', async (req, res) => {
     return res.status(500).json({ message: 'Failed to fetch vendors' });
   }
 });
+
 app.get('/vendors/:vendorName/brands', async (req, res) => {
   const vendorName = req.params.vendorName;
   const connection = await db.getConnection();
@@ -1311,6 +1312,56 @@ app.get('/api/bank-accounts/active', async (req, res) => {
     } catch (error) {
         console.error('Failed to fetch active bank accounts:', error);
         res.status(500).json({ message: 'Error fetching bank accounts' });
+    }
+});
+
+app.post('/add-single-product', async (req, res) => {
+    try {
+        const { items } = req.body;
+        
+        const [vendors] = await db.query(`SELECT id FROM vendors LIMIT 1`);
+        if (vendors.length === 0) {
+            return res.status(400).json({ message: 'A vendor must exist in the database to add a product.' });
+        }
+        const defaultVendorId = vendors[0].id;
+
+        for (const item of items) {
+            let brandId = null;
+            if (item.brand) {
+                const [existingBrand] = await db.query(`SELECT id FROM brands WHERE name = ?`, [item.brand]);
+                if (existingBrand.length > 0) {
+                    brandId = existingBrand[0].id;
+                } else {
+                    const [newBrand] = await db.query(`INSERT INTO brands (name) VALUES (?)`, [item.brand]);
+                    brandId = newBrand.insertId;
+                }
+            }
+
+            const [newItem] = await db.query(
+                `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    defaultVendorId,
+                    brandId,
+                    item.productName,
+                    item.category,
+                    item.quantity,
+                    item.unit,
+                    item.unitPrice,
+                    item.sellingPrice,
+                    item.total
+                ]
+            );
+
+            await db.query(
+                `INSERT INTO inventory (item_id, stock) VALUES (?, ?)`,
+                [newItem.insertId, item.quantity]
+            );
+        }
+
+        res.status(200).json({ message: 'Products added successfully' });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
     }
 });
 
