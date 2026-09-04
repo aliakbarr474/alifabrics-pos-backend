@@ -319,7 +319,6 @@ app.post('/checkout', async (req, res) => {
 
     let customerId = null;
 
-    // --- CREDIT UPDATE LOGIC ---
     if (customerPhone) {
       const balanceAddition = netTotal - paid; // This is the credit amount
       
@@ -1362,6 +1361,23 @@ app.post('/add-single-product', async (req, res) => {
         res.status(200).json({ message: 'Products added successfully' });
     } catch (error) {
         res.status(500).json({ message: error.message });
+    }
+});
+
+app.post('/customers', async (req, res) => {
+    try {
+        const { name, phone } = req.body;
+        if (!name) {
+            return res.status(400).json({ message: 'Customer name is required' });
+        }
+        
+        const query = `INSERT INTO customers (name, phone) VALUES ($1, $2) RETURNING *`;
+        const values = [name, phone || null];
+        const result = await pool.query(query, values);
+        
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
     }
 });
 
