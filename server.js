@@ -7,7 +7,6 @@ const bcrypt = require('bcrypt');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const excelJS = require('exceljs');
-const initTables = require('./schema');
 
 const app = express();
 app.use(cors());
@@ -33,7 +32,7 @@ module.exports = db;
 db.getConnection()
   .then(connection => {
     console.log("Connected to MySQL database.");
-    initTables(db);
+    // initTables(db);
     connection.release();
   })
   .catch(err => {
