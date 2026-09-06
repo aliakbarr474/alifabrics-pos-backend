@@ -85,6 +85,20 @@ process.on('unhandledRejection', (reason, promise) => {
 
 whatsappClient.initialize();
 
+const verifyToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' });
+
+    const secretKey = process.env.JWT_SECRET || 'ali_fabrics_super_secret_key_123';
+    
+    jwt.verify(token, secretKey, (err, user) => {
+        if (err) return res.status(403).json({ message: 'Invalid or expired token' });
+        req.user = user;
+        next();
+    });
+};
+
 app.post('/register', async (req, res) => {
   const { email, password } = req.body;
 
@@ -155,7 +169,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-app.post('/add-product', async (req, res) => {
+app.post('/add-product', verifyToken, async (req, res) => {
   const { vendorName, vendorPhone, items } = req.body;
 
   const parsedVendorName = typeof vendorName === 'object' && vendorName !== null
@@ -274,7 +288,7 @@ app.post('/add-product', async (req, res) => {
   }
 });
 
-app.post('/checkout', async (req, res) => {
+app.post('/checkout', verifyToken, async (req, res) => {
   const { cart, subtotal, discount, customerName, customerPhone, sendWhatsApp, paymentMethod, amountPaid, bankAccountId } = req.body;
 
   if (!cart || cart.length === 0) {
@@ -375,7 +389,7 @@ app.post('/checkout', async (req, res) => {
   }
 });
 
-app.get('/customers', async (req, res) => {
+app.get('/customers', verifyToken, async (req, res) => {
   try {
     const query = `
       SELECT id, name, phone, total_spent, total_orders, balance_due, created_at 
@@ -390,7 +404,7 @@ app.get('/customers', async (req, res) => {
   }
 });
 
-app.get('/customers/:id/history', async (req, res) => {
+app.get('/customers/:id/history', verifyToken, async (req, res) => {
   const customerId = req.params.id;
 
   try {
@@ -415,7 +429,7 @@ app.get('/customers/:id/history', async (req, res) => {
   }
 });
 
-app.get('/customers/:id/history', async (req, res) => {
+app.get('/customers/:id/history', verifyToken, async (req, res) => {
   const customerId = req.params.id;
 
   try {
@@ -439,7 +453,7 @@ app.get('/customers/:id/history', async (req, res) => {
   }
 });
 
-app.get('/vendors', async (req, res) => {
+app.get('/vendors', verifyToken, async (req, res) => {
   try {
     const query = `
       SELECT 
@@ -459,7 +473,7 @@ app.get('/vendors', async (req, res) => {
   }
 });
 
-app.get('/inventory/:id/history', async (req, res) => {
+app.get('/inventory/:id/history', verifyToken, async (req, res) => {
   const itemId = req.params.id;
 
   try {
@@ -485,7 +499,7 @@ app.get('/inventory/:id/history', async (req, res) => {
   }
 });
 
-app.post('/add-vendors', async (req, res) => {
+app.post('/add-vendors', verifyToken, async (req, res) => {
   const { vendorName, contact, balance } = req.body;
 
   try {
@@ -501,7 +515,7 @@ app.post('/add-vendors', async (req, res) => {
   }
 });
 
-app.get('/get-vendors', async (req, res) => {
+app.get('/get-vendors', verifyToken, async (req, res) => {
   try {
     const getVendorQuery =
       `SELECT id, contact_person, phone, current_balance FROM vendors ORDER BY created_at ASC`
@@ -514,7 +528,7 @@ app.get('/get-vendors', async (req, res) => {
   }
 });
 
-app.get('/vendors/:vendorName/brands', async (req, res) => {
+app.get('/vendors/:vendorName/brands', verifyToken, async (req, res) => {
   const vendorName = req.params.vendorName;
   const connection = await db.getConnection();
 
@@ -545,7 +559,7 @@ app.get('/vendors/:vendorName/brands', async (req, res) => {
   }
 });
 
-app.get('/vendors/:id/details', async (req, res) => {
+app.get('/vendors/:id/details', verifyToken, async (req, res) => {
   const vendorId = req.params.id;
 
   try {
@@ -574,7 +588,7 @@ app.get('/vendors/:id/details', async (req, res) => {
   }
 });
 
-app.post('/add-payment', async (req, res) => {
+app.post('/add-payment', verifyToken, async (req, res) => {
   const { amount, method, vendor_id, description } = req.body;
   const connection = await db.getConnection();
 
@@ -623,7 +637,7 @@ app.post('/add-payment', async (req, res) => {
   }
 });
 
-app.get('/get-payments', async (req, res) => {
+app.get('/get-payments', verifyToken, async (req, res) => {
   try {
     const getPayments = `
       SELECT
@@ -649,7 +663,7 @@ app.get('/get-payments', async (req, res) => {
   }
 });
 
-app.get('/vendors/:id/ledger', async (req, res) => {
+app.get('/vendors/:id/ledger', verifyToken, async (req, res) => {
   const vendorId = req.params.id;
 
   try {
@@ -690,7 +704,7 @@ app.get('/vendors/:id/ledger', async (req, res) => {
   }
 });
 
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', verifyToken, async (req, res) => {
   try {
     const fetchUsersSql = 'SELECT id, username, password FROM users';
     const [users] = await db.query(fetchUsersSql);
@@ -702,7 +716,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', verifyToken, async (req, res) => {
   const userId = req.params.id;
 
   try {
@@ -720,7 +734,7 @@ app.delete('/api/users/:id', async (req, res) => {
   }
 });
 
-app.get('/api/dashboard/summary', async (req, res) => {
+app.get('/api/dashboard/summary', verifyToken, async (req, res) => {
   const { filter = 'weekly' } = req.query;
   let dateCondition = 's.sale_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
   let groupBy = 'DATE(s.sale_date)';
@@ -906,7 +920,7 @@ app.get('/api/dashboard/summary', async (req, res) => {
   }
 });
 
-app.get('/api/dashboard/pnl', async (req, res) => {
+app.get('/api/dashboard/pnl', verifyToken, async (req, res) => {
   const { filter = 'weekly' } = req.query;
   let dateCondition = 's.sale_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
 
@@ -940,7 +954,7 @@ app.get('/api/dashboard/pnl', async (req, res) => {
   }
 });
 
-app.post('/add-customer-payment', async (req, res) => {
+app.post('/add-customer-payment', verifyToken, async (req, res) => {
   const { customerId, method, amount } = req.body;
 
   if (!customerId || !method || !amount) {
@@ -974,7 +988,7 @@ app.post('/add-customer-payment', async (req, res) => {
   }
 });
 
-app.post('/api/settings/brand', async (req, res) => {
+app.post('/api/settings/brand', verifyToken, async (req, res) => {
   const { storeName, address, phone, currency } = req.body;
 
   try {
@@ -997,7 +1011,7 @@ app.post('/api/settings/brand', async (req, res) => {
   }
 });
 
-app.get('/api/backup', async (req, res) => {
+app.get('/api/backup', verifyToken, async (req, res) => {
   const { table } = req.query;
 
   let sql = '';
@@ -1131,7 +1145,7 @@ app.get('/api/backup', async (req, res) => {
   }
 });
 
-app.get('/invoices', async (req, res) => {
+app.get('/invoices', verifyToken, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const [rows] = await connection.query(`
@@ -1156,7 +1170,7 @@ app.get('/invoices', async (req, res) => {
   }
 });
 
-app.get('/invoices/:id/items', async (req, res) => {
+app.get('/invoices/:id/items', verifyToken, async (req, res) => {
   const connection = await db.getConnection();
   try {
     const [rows] = await connection.query(`
@@ -1178,10 +1192,9 @@ app.get('/invoices/:id/items', async (req, res) => {
   }
 });
 
-app.post('/return', async (req, res) => {
+app.post('/return', verifyToken, async (req, res) => {
   const { saleId, customerId, returnItems, totalRefund } = req.body;
 
-  // 1. Fixed validation to check for 'item.id'
   if (!returnItems || returnItems.some(item => item.id == null)) {
     return res.status(400).json({
       message: "Invalid payload: 'id' is missing in one or more return items."
@@ -1237,7 +1250,7 @@ app.post('/return', async (req, res) => {
   }
 });
 
-app.get('/inventory', async (req, res) => {
+app.get('/inventory', verifyToken, async (req, res) => {
   try {
     const query = `
       SELECT 
@@ -1265,7 +1278,7 @@ app.get('/inventory', async (req, res) => {
   }
 });
 
-app.get('/bank-accounts', async (req, res) => {
+app.get('/bank-accounts', verifyToken, async (req, res) => {
   try {
     const [accounts] = await db.query(
       'SELECT id, bank_name, account_title, account_number, qr_code, is_active FROM business_bank_accounts ORDER BY created_at DESC'
@@ -1276,7 +1289,7 @@ app.get('/bank-accounts', async (req, res) => {
   }
 });
 
-app.post('/bank-accounts', async (req, res) => {
+app.post('/bank-accounts', verifyToken, async (req, res) => {
   const { bank_name, account_title, account_number, qr_code } = req.body;
 
   if (!bank_name || !account_title || !account_number) {
@@ -1295,7 +1308,7 @@ app.post('/bank-accounts', async (req, res) => {
   }
 });
 
-app.patch('/bank-accounts/:id/toggle', async (req, res) => {
+app.patch('/bank-accounts/:id/toggle', verifyToken, async (req, res) => {
   const { id } = req.params;
   const { is_active } = req.body;
 
@@ -1310,7 +1323,7 @@ app.patch('/bank-accounts/:id/toggle', async (req, res) => {
   }
 });
 
-app.get('/api/bank-accounts/active', async (req, res) => {
+app.get('/api/bank-accounts/active', verifyToken, async (req, res) => {
   try {
     const [accounts] = await db.query(
       'SELECT id, bank_name, account_title, account_number, qr_code FROM business_bank_accounts WHERE is_active = TRUE ORDER BY bank_name ASC'
@@ -1322,7 +1335,7 @@ app.get('/api/bank-accounts/active', async (req, res) => {
   }
 });
 
-app.post('/add-single-product', async (req, res) => {
+app.post('/add-single-product', verifyToken, async (req, res) => {
   try {
     const { items } = req.body;
 
@@ -1372,7 +1385,7 @@ app.post('/add-single-product', async (req, res) => {
   }
 });
 
-app.post('/customers', async (req, res) => {
+app.post('/customers', verifyToken, async (req, res) => {
   try {
     const { name, phone } = req.body;
     if (!name) {
@@ -1393,14 +1406,13 @@ app.post('/customers', async (req, res) => {
   }
 });
 
-app.delete('/inventory/:id', async (req, res) => {
+app.delete('/inventory/:id', verifyToken, async (req, res) => {
     const itemId = req.params.id;
     const connection = await db.getConnection();
 
     try {
         await connection.beginTransaction();
 
-        // Check if item exists in sale_items to prevent foreign key crashes
         const [salesCheck] = await connection.query(
             `SELECT COUNT(*) as count FROM sale_items WHERE item_id = ?`,
             [itemId]
@@ -1432,14 +1444,13 @@ app.delete('/inventory/:id', async (req, res) => {
     }
 });
 
-app.delete('/vendors/:id', async (req, res) => {
+app.delete('/vendors/:id', verifyToken, async (req, res) => {
     const vendorId = req.params.id;
     const connection = await db.getConnection();
 
     try {
         await connection.beginTransaction();
 
-        // Check if vendor has associated purchases
         const [purchasesCheck] = await connection.query(
             `SELECT COUNT(*) as count FROM purchases WHERE vendor_id = ?`,
             [vendorId]
@@ -1471,7 +1482,7 @@ app.delete('/vendors/:id', async (req, res) => {
     }
 });
 
-app.delete('/customers/:id', async (req, res) => {
+app.delete('/customers/:id', verifyToken, async (req, res) => {
     const customerId = req.params.id;
     const connection = await db.getConnection();
 
