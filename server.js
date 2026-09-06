@@ -308,8 +308,8 @@ app.post('/checkout', async (req, res) => {
 
       if (item.quantity > rows[0].stock) {
         await connection.rollback();
-        return res.status(400).json({ 
-          message: `Cannot process: ${item.productName} only has ${rows[0].stock} ${item.unit || 'm'} left.` 
+        return res.status(400).json({
+          message: `Cannot process: ${item.productName} only has ${rows[0].stock} ${item.unit || 'm'} left.`
         });
       }
 
@@ -320,7 +320,7 @@ app.post('/checkout', async (req, res) => {
 
     if (customerPhone) {
       const balanceAddition = netTotal - paid; // This is the credit amount
-      
+
       const upsertCustomerQuery = `
         INSERT INTO customers (name, phone, total_spent, total_orders, balance_due)
         VALUES (?, ?, ?, 1, ?)
@@ -331,14 +331,14 @@ app.post('/checkout', async (req, res) => {
           total_orders = total_orders + 1,
           balance_due = balance_due + VALUES(balance_due)
       `;
-      
+
       const [customerResult] = await connection.query(upsertCustomerQuery, [
-        customerName || 'Walk-in Customer', 
-        customerPhone, 
+        customerName || 'Walk-in Customer',
+        customerPhone,
         netTotal,
         balanceAddition
       ]);
-      
+
       customerId = customerResult.insertId;
 
       if (paid > 0) {
@@ -392,7 +392,7 @@ app.get('/customers', async (req, res) => {
 
 app.get('/customers/:id/history', async (req, res) => {
   const customerId = req.params.id;
-  
+
   try {
     const query = `
       SELECT 
@@ -417,7 +417,7 @@ app.get('/customers/:id/history', async (req, res) => {
 
 app.get('/customers/:id/history', async (req, res) => {
   const customerId = req.params.id;
-  
+
   try {
     const query = `
       SELECT 
@@ -594,7 +594,7 @@ app.post('/add-payment', async (req, res) => {
 
     try {
       const [vendorRows] = await connection.query(`SELECT contact_person, phone FROM vendors WHERE id = ?`, [vendor_id]);
-      
+
       if (vendorRows.length > 0 && vendorRows[0].phone) {
         const cleanPhone = vendorRows[0].phone.replace(/\D/g, '');
         const vendorName = vendorRows[0].contact_person || 'Vendor';
@@ -694,7 +694,7 @@ app.get('/api/users', async (req, res) => {
   try {
     const fetchUsersSql = 'SELECT id, username, password FROM users';
     const [users] = await db.query(fetchUsersSql);
-    
+
     return res.status(200).json(users);
   } catch (error) {
     console.error('Fetch users error:', error);
@@ -803,7 +803,7 @@ app.get('/api/dashboard/summary', async (req, res) => {
         LIMIT 5
       `),
       db.query(`SELECT COALESCE(SUM(balance_due), 0) AS customer_dues FROM customers`),
-      
+
       db.query(`
         SELECT COUNT(*) AS dead_stock_count
         FROM items i 
@@ -828,7 +828,7 @@ app.get('/api/dashboard/summary', async (req, res) => {
           WHERE s.sale_date >= DATE_SUB(CURDATE(), INTERVAL 2 MONTH)
         )
       `),
-      
+
       db.query(`
         SELECT COALESCE(i.category, 'Other') AS name, SUM(si.meters_sold * si.unit_price) AS value
         FROM sale_items si
@@ -871,7 +871,17 @@ app.get('/api/dashboard/summary', async (req, res) => {
           COALESCE((SELECT SUM(amount) FROM customer_payments WHERE bank_account_id = b.id), 0) AS balance
         FROM business_bank_accounts b
         WHERE b.is_active = TRUE
-      `)
+      `),
+      db.query(`
+  SELECT 
+    b.bank_name, 
+    b.account_title,
+    COALESCE((SELECT SUM(amount_paid) FROM sales WHERE bank_account_id = b.id), 0) +
+    COALESCE((SELECT SUM(amount) FROM customer_payments WHERE bank_account_id = b.id), 0) -
+    COALESCE((SELECT SUM(amount) FROM payments WHERE bank_account_id = b.id), 0) AS balance
+  FROM business_bank_accounts b
+  WHERE b.is_active = TRUE
+`)
     ]);
 
     const cash = Number(cashData[0][0].total_cash) || 0;
@@ -942,77 +952,77 @@ app.get('/api/dashboard/pnl', async (req, res) => {
 });
 
 app.post('/add-customer-payment', async (req, res) => {
-    const { customerId, method, amount } = req.body;
+  const { customerId, method, amount } = req.body;
 
-    if (!customerId || !method || !amount) {
-        return res.status(400).json({ message: "Missing required payment fields" });
-    }
+  if (!customerId || !method || !amount) {
+    return res.status(400).json({ message: "Missing required payment fields" });
+  }
 
-    const connection = await db.getConnection();
+  const connection = await db.getConnection();
 
-    try {
-        await connection.beginTransaction();
+  try {
+    await connection.beginTransaction();
 
-        const [paymentResult] = await connection.query(
-            `INSERT INTO customer_payments (customer_id, amount, method, payment_date) VALUES (?, ?, ?, NOW())`,
-            [customerId, amount, method]
-        );
-        const paymentId = paymentResult.insertId;
+    const [paymentResult] = await connection.query(
+      `INSERT INTO customer_payments (customer_id, amount, method, payment_date) VALUES (?, ?, ?, NOW())`,
+      [customerId, amount, method]
+    );
+    const paymentId = paymentResult.insertId;
 
-        await connection.query(
-            `UPDATE customers SET balance_due = balance_due - ? WHERE id = ?`,
-            [amount, customerId]
-        );
+    await connection.query(
+      `UPDATE customers SET balance_due = balance_due - ? WHERE id = ?`,
+      [amount, customerId]
+    );
 
-        await connection.commit();
-        res.status(200).json({ message: "Payment added successfully", paymentId: paymentId });
+    await connection.commit();
+    res.status(200).json({ message: "Payment added successfully", paymentId: paymentId });
 
-    } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ message: "Payment failed, changes reverted." });
-    } finally {
-        connection.release();
-    }
+  } catch (error) {
+    await connection.rollback();
+    res.status(500).json({ message: "Payment failed, changes reverted." });
+  } finally {
+    connection.release();
+  }
 });
 
 app.post('/api/settings/brand', async (req, res) => {
-    const { storeName, address, phone, currency } = req.body;
+  const { storeName, address, phone, currency } = req.body;
 
-    try {
-        const query = `
+  try {
+    const query = `
             UPDATE brand_info 
             SET store_name = ?, address = ?, phone = ?, currency = ? 
             WHERE id = 1
         `;
-        const [result] = await pool.execute(query, [storeName, address, phone, currency]);
+    const [result] = await pool.execute(query, [storeName, address, phone, currency]);
 
-        if (result.affectedRows === 0) {
-            const insertQuery = `INSERT INTO brand_info (id, store_name, address, phone, currency) VALUES (1, ?, ?, ?, ?)`;
-            await pool.execute(insertQuery, [storeName, address, phone, currency]);
-        }
-
-        res.status(200).json({ message: 'Brand settings updated successfully' });
-    } catch (error) {
-        console.error('Error saving brand info:', error);
-        res.status(500).json({ message: 'Internal server error' });
+    if (result.affectedRows === 0) {
+      const insertQuery = `INSERT INTO brand_info (id, store_name, address, phone, currency) VALUES (1, ?, ?, ?, ?)`;
+      await pool.execute(insertQuery, [storeName, address, phone, currency]);
     }
+
+    res.status(200).json({ message: 'Brand settings updated successfully' });
+  } catch (error) {
+    console.error('Error saving brand info:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
 });
 
 app.get('/api/backup', async (req, res) => {
-    const { table } = req.query;
-    
-    let sql = '';
-    
-    switch (table) {
-        case 'customers':
-            sql = `
+  const { table } = req.query;
+
+  let sql = '';
+
+  switch (table) {
+    case 'customers':
+      sql = `
                 SELECT id, name, phone, total_spent, total_orders, created_at 
                 FROM customers
             `;
-            break;
-            
-        case 'inventory':
-            sql = `
+      break;
+
+    case 'inventory':
+      sql = `
                 SELECT 
                     inv.id, 
                     i.name AS item_name, 
@@ -1021,10 +1031,10 @@ app.get('/api/backup', async (req, res) => {
                 FROM inventory inv
                 LEFT JOIN items i ON inv.item_id = i.id
             `;
-            break;
-            
-        case 'items':
-            sql = `
+      break;
+
+    case 'items':
+      sql = `
                 SELECT 
                     i.id, 
                     i.name, 
@@ -1042,10 +1052,10 @@ app.get('/api/backup', async (req, res) => {
                 LEFT JOIN vendors v ON i.vendor_id = v.id
                 LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
             `;
-            break;
-            
-        case 'payments':
-            sql = `
+      break;
+
+    case 'payments':
+      sql = `
                 SELECT 
                     p.id, 
                     COALESCE(vcn.company_name, v.contact_person, 'Unknown Vendor') AS vendor, 
@@ -1057,10 +1067,10 @@ app.get('/api/backup', async (req, res) => {
                 LEFT JOIN vendors v ON p.vendor_id = v.id
                 LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
             `;
-            break;
-            
-        case 'purchases':
-            sql = `
+      break;
+
+    case 'purchases':
+      sql = `
                 SELECT 
                     p.id, 
                     COALESCE(vcn.company_name, v.contact_person, 'Unknown Vendor') AS vendor, 
@@ -1071,10 +1081,10 @@ app.get('/api/backup', async (req, res) => {
                 LEFT JOIN vendors v ON p.vendor_id = v.id
                 LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
             `;
-            break;
-            
-        case 'vendors':
-            sql = `
+      break;
+
+    case 'vendors':
+      sql = `
                 SELECT 
                     v.id, 
                     v.contact_person, 
@@ -1085,51 +1095,51 @@ app.get('/api/backup', async (req, res) => {
                 FROM vendors v
                 LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
             `;
-            break;
-            
-        default:
-            return res.status(400).json({ message: 'Invalid table selected' });
+      break;
+
+    default:
+      return res.status(400).json({ message: 'Invalid table selected' });
+  }
+
+  try {
+    const [rows] = await db.query(sql);
+
+    const workbook = new excelJS.Workbook();
+    const worksheet = workbook.addWorksheet(table);
+
+    if (rows.length > 0) {
+      const columns = Object.keys(rows[0]).map(key => ({
+        header: key.replace(/_/g, ' ').toUpperCase(),
+        key: key,
+        width: 25
+      }));
+      worksheet.columns = columns;
+
+      worksheet.getRow(1).font = { bold: true };
+
+      rows.forEach(row => {
+        worksheet.addRow(row);
+      });
+    } else {
+      worksheet.columns = [{ header: 'INFO', key: 'info', width: 40 }];
+      worksheet.addRow({ info: `No records found in the ${table} table.` });
     }
 
-    try {
-        const [rows] = await db.query(sql);
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename=${table}_backup.xlsx`
+    );
 
-        const workbook = new excelJS.Workbook();
-        const worksheet = workbook.addWorksheet(table);
-
-        if (rows.length > 0) {
-            const columns = Object.keys(rows[0]).map(key => ({
-                header: key.replace(/_/g, ' ').toUpperCase(),
-                key: key,
-                width: 25
-            }));
-            worksheet.columns = columns;
-
-            worksheet.getRow(1).font = { bold: true };
-
-            rows.forEach(row => {
-                worksheet.addRow(row);
-            });
-        } else {
-            worksheet.columns = [{ header: 'INFO', key: 'info', width: 40 }];
-            worksheet.addRow({ info: `No records found in the ${table} table.` });
-        }
-
-        res.setHeader(
-            'Content-Type',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        );
-        res.setHeader(
-            'Content-Disposition',
-            `attachment; filename=${table}_backup.xlsx`
-        );
-
-        await workbook.xlsx.write(res);
-        res.end();
-    } catch (error) {
-        console.error('Backup error:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    }
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error('Backup error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
 });
 
 app.get('/invoices', async (req, res) => {
@@ -1181,11 +1191,11 @@ app.get('/invoices/:id/items', async (req, res) => {
 
 app.post('/return', async (req, res) => {
   const { saleId, customerId, returnItems, totalRefund } = req.body;
-  
+
   // 1. Fixed validation to check for 'item.id'
   if (!returnItems || returnItems.some(item => item.id == null)) {
-    return res.status(400).json({ 
-      message: "Invalid payload: 'id' is missing in one or more return items." 
+    return res.status(400).json({
+      message: "Invalid payload: 'id' is missing in one or more return items."
     });
   }
 
@@ -1202,11 +1212,11 @@ app.post('/return', async (req, res) => {
 
     for (const item of returnItems) {
       if (item.quantity > 0) {
-        const itemRefundAmount = item.sellingPrice; 
+        const itemRefundAmount = item.sellingPrice;
 
         await connection.query(
           `INSERT INTO return_items (return_id, item_id, quantity, refund_amount) VALUES (?, ?, ?, ?)`,
-          [returnId, item.id, item.quantity, itemRefundAmount] 
+          [returnId, item.id, item.quantity, itemRefundAmount]
         );
 
         await connection.query(
@@ -1216,7 +1226,7 @@ app.post('/return', async (req, res) => {
 
         await connection.query(
           `UPDATE inventory SET stock = stock + ? WHERE item_id = ?`,
-          [item.quantity, item.id] 
+          [item.quantity, item.id]
         );
       }
     }
@@ -1267,131 +1277,131 @@ app.get('/inventory', async (req, res) => {
 });
 
 app.get('/bank-accounts', async (req, res) => {
-    try {
-        const [accounts] = await db.query(
-            'SELECT id, bank_name, account_title, account_number, qr_code, is_active FROM business_bank_accounts ORDER BY created_at DESC'
-        );
-        res.status(200).json(accounts);
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to fetch bank accounts' });
-    }
+  try {
+    const [accounts] = await db.query(
+      'SELECT id, bank_name, account_title, account_number, qr_code, is_active FROM business_bank_accounts ORDER BY created_at DESC'
+    );
+    res.status(200).json(accounts);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch bank accounts' });
+  }
 });
 
 app.post('/bank-accounts', async (req, res) => {
-    const { bank_name, account_title, account_number, qr_code } = req.body;
-    
-    if (!bank_name || !account_title || !account_number) {
-        return res.status(400).json({ message: 'Missing required fields' });
-    }
+  const { bank_name, account_title, account_number, qr_code } = req.body;
 
-    try {
-        await db.query(
-            `INSERT INTO business_bank_accounts (bank_name, account_title, account_number, qr_code, is_active) 
+  if (!bank_name || !account_title || !account_number) {
+    return res.status(400).json({ message: 'Missing required fields' });
+  }
+
+  try {
+    await db.query(
+      `INSERT INTO business_bank_accounts (bank_name, account_title, account_number, qr_code, is_active) 
              VALUES (?, ?, ?, ?, TRUE)`,
-            [bank_name, account_title, account_number, qr_code || null]
-        );
-        res.status(201).json({ message: 'Bank account added successfully' });
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to add bank account' });
-    }
+      [bank_name, account_title, account_number, qr_code || null]
+    );
+    res.status(201).json({ message: 'Bank account added successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to add bank account' });
+  }
 });
 
 app.patch('/bank-accounts/:id/toggle', async (req, res) => {
-    const { id } = req.params;
-    const { is_active } = req.body;
-    
-    try {
-        await db.query(
-            'UPDATE business_bank_accounts SET is_active = ? WHERE id = ?',
-            [is_active, id]
-        );
-        res.status(200).json({ message: 'Bank account status updated' });
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to update bank account status' });
-    }
+  const { id } = req.params;
+  const { is_active } = req.body;
+
+  try {
+    await db.query(
+      'UPDATE business_bank_accounts SET is_active = ? WHERE id = ?',
+      [is_active, id]
+    );
+    res.status(200).json({ message: 'Bank account status updated' });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to update bank account status' });
+  }
 });
 
 app.get('/api/bank-accounts/active', async (req, res) => {
-    try {
-        const [accounts] = await db.query(
-            'SELECT id, bank_name, account_title, account_number, qr_code FROM business_bank_accounts WHERE is_active = TRUE ORDER BY bank_name ASC'
-        );
-        res.status(200).json(accounts);
-    } catch (error) {
-        console.error('Failed to fetch active bank accounts:', error);
-        res.status(500).json({ message: 'Error fetching bank accounts' });
-    }
+  try {
+    const [accounts] = await db.query(
+      'SELECT id, bank_name, account_title, account_number, qr_code FROM business_bank_accounts WHERE is_active = TRUE ORDER BY bank_name ASC'
+    );
+    res.status(200).json(accounts);
+  } catch (error) {
+    console.error('Failed to fetch active bank accounts:', error);
+    res.status(500).json({ message: 'Error fetching bank accounts' });
+  }
 });
 
 app.post('/add-single-product', async (req, res) => {
-    try {
-        const { items } = req.body;
-        
-        const [vendors] = await db.query(`SELECT id FROM vendors LIMIT 1`);
-        if (vendors.length === 0) {
-            return res.status(400).json({ message: 'A vendor must exist in the database to add a product.' });
-        }
-        const defaultVendorId = vendors[0].id;
+  try {
+    const { items } = req.body;
 
-        for (const item of items) {
-            let brandId = null;
-            if (item.brand) {
-                const [existingBrand] = await db.query(`SELECT id FROM brands WHERE name = ?`, [item.brand]);
-                if (existingBrand.length > 0) {
-                    brandId = existingBrand[0].id;
-                } else {
-                    const [newBrand] = await db.query(`INSERT INTO brands (name) VALUES (?)`, [item.brand]);
-                    brandId = newBrand.insertId;
-                }
-            }
-
-            const [newItem] = await db.query(
-                `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    defaultVendorId,
-                    brandId,
-                    item.productName,
-                    item.category,
-                    item.quantity,
-                    item.unit,
-                    item.unitPrice,
-                    item.sellingPrice,
-                    item.total
-                ]
-            );
-
-            await db.query(
-                `INSERT INTO inventory (item_id, stock) VALUES (?, ?)`,
-                [newItem.insertId, item.quantity]
-            );
-        }
-
-        res.status(200).json({ message: 'Products added successfully' });
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    const [vendors] = await db.query(`SELECT id FROM vendors LIMIT 1`);
+    if (vendors.length === 0) {
+      return res.status(400).json({ message: 'A vendor must exist in the database to add a product.' });
     }
+    const defaultVendorId = vendors[0].id;
+
+    for (const item of items) {
+      let brandId = null;
+      if (item.brand) {
+        const [existingBrand] = await db.query(`SELECT id FROM brands WHERE name = ?`, [item.brand]);
+        if (existingBrand.length > 0) {
+          brandId = existingBrand[0].id;
+        } else {
+          const [newBrand] = await db.query(`INSERT INTO brands (name) VALUES (?)`, [item.brand]);
+          brandId = newBrand.insertId;
+        }
+      }
+
+      const [newItem] = await db.query(
+        `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          defaultVendorId,
+          brandId,
+          item.productName,
+          item.category,
+          item.quantity,
+          item.unit,
+          item.unitPrice,
+          item.sellingPrice,
+          item.total
+        ]
+      );
+
+      await db.query(
+        `INSERT INTO inventory (item_id, stock) VALUES (?, ?)`,
+        [newItem.insertId, item.quantity]
+      );
+    }
+
+    res.status(200).json({ message: 'Products added successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
 app.post('/customers', async (req, res) => {
-    try {
-        const { name, phone } = req.body;
-        if (!name) {
-            return res.status(400).json({ message: 'Customer name is required' });
-        }
-        
-        const query = `INSERT INTO customers (name, phone) VALUES (?, ?)`;
-        const values = [name, phone || null];
-        const result = await db.query(query, values);
-        
-        res.status(201).json({ 
-            id: result.insertId, 
-            name: name, 
-            phone: phone 
-        });
-    } catch (err) {
-        res.status(500).json({ message: err.message });
+  try {
+    const { name, phone } = req.body;
+    if (!name) {
+      return res.status(400).json({ message: 'Customer name is required' });
     }
+
+    const query = `INSERT INTO customers (name, phone) VALUES (?, ?)`;
+    const values = [name, phone || null];
+    const result = await db.query(query, values);
+
+    res.status(201).json({
+      id: result.insertId,
+      name: name,
+      phone: phone
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 app.listen(PORT, () => {
