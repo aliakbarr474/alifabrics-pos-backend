@@ -803,7 +803,6 @@ app.get('/api/dashboard/summary', async (req, res) => {
         LIMIT 5
       `),
       db.query(`SELECT COALESCE(SUM(balance_due), 0) AS customer_dues FROM customers`),
-
       db.query(`
         SELECT COUNT(*) AS dead_stock_count
         FROM items i 
@@ -828,7 +827,6 @@ app.get('/api/dashboard/summary', async (req, res) => {
           WHERE s.sale_date >= DATE_SUB(CURDATE(), INTERVAL 2 MONTH)
         )
       `),
-
       db.query(`
         SELECT COALESCE(i.category, 'Other') AS name, SUM(si.meters_sold * si.unit_price) AS value
         FROM sale_items si
@@ -868,17 +866,10 @@ app.get('/api/dashboard/summary', async (req, res) => {
           b.bank_name, 
           b.account_title,
           COALESCE((SELECT SUM(amount_paid) FROM sales WHERE bank_account_id = b.id), 0) +
-          COALESCE((SELECT SUM(amount) FROM customer_payments WHERE bank_account_id = b.id), 0) AS balance
+          COALESCE((SELECT SUM(amount) FROM customer_payments WHERE bank_account_id = b.id), 0) -
+          COALESCE((SELECT SUM(amount) FROM payments WHERE bank_account_id = b.id), 0) AS balance
         FROM business_bank_accounts b
         WHERE b.is_active = TRUE
-      `),
-      db.query(`
-        SELECT 
-          bank_name, 
-          account_title,
-          0 AS balance 
-        FROM business_bank_accounts 
-        WHERE is_active = TRUE
       `)
     ]);
 
