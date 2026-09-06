@@ -275,7 +275,7 @@ app.post('/add-product', async (req, res) => {
 });
 
 app.post('/checkout', async (req, res) => {
-  const { cart, subtotal, discount, customerName, customerPhone, sendWhatsApp, paymentMethod, amountPaid } = req.body;
+  const { cart, subtotal, discount, customerName, customerPhone, sendWhatsApp, paymentMethod, amountPaid, bankAccountId } = req.body;
 
   if (!cart || cart.length === 0) {
     return res.status(400).json({ message: "Cart is empty" });
@@ -319,7 +319,7 @@ app.post('/checkout', async (req, res) => {
     let customerId = null;
 
     if (customerPhone) {
-      const balanceAddition = netTotal - paid; // This is the credit amount
+      const balanceAddition = netTotal - paid;
 
       const upsertCustomerQuery = `
         INSERT INTO customers (name, phone, total_spent, total_orders, balance_due)
@@ -343,15 +343,15 @@ app.post('/checkout', async (req, res) => {
 
       if (paid > 0) {
         await connection.query(
-          `INSERT INTO customer_payments (customer_id, amount, method) VALUES (?, ?, ?)`,
-          [customerId, paid, paymentMethod || 'Cash']
+          `INSERT INTO customer_payments (customer_id, amount, method, bank_account_id) VALUES (?, ?, ?, ?)`,
+          [customerId, paid, paymentMethod || 'Cash', bankAccountId || null]
         );
       }
     }
 
     const [saleResult] = await connection.query(
-      `INSERT INTO sales (customer_id, total_amount, discount, payment_method, amount_paid, invoice_number) VALUES (?, ?, ?, ?, ?, ?)`,
-      [customerId, subtotal, discount || 0, paymentMethod || 'Cash', paid, invoiceNumber]
+      `INSERT INTO sales (customer_id, total_amount, discount, payment_method, amount_paid, invoice_number, bank_account_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [customerId, subtotal, discount || 0, paymentMethod || 'Cash', paid, invoiceNumber, bankAccountId || null]
     );
     const saleId = saleResult.insertId;
 
