@@ -1384,7 +1384,11 @@ app.post('/customers', async (req, res) => {
         const values = [name, phone || null];
         const result = await db.query(query, values);
         
-        res.status(201).json(result.rows[0]);
+        res.status(201).json({ 
+            id: result.insertId, 
+            name: name, 
+            phone: phone 
+        });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
