@@ -1181,6 +1181,13 @@ app.get('/invoices/:id/items', async (req, res) => {
 
 app.post('/return', async (req, res) => {
   const { saleId, customerId, returnItems, totalRefund } = req.body;
+
+  if (!returnItems || returnItems.some(item => item.itemId == null)) {
+    return res.status(400).json({ 
+      message: "Invalid payload: 'itemId' is missing in one or more return items." 
+    });
+  }
+
   const connection = await db.getConnection();
 
   try {
