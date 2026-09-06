@@ -1380,7 +1380,7 @@ app.post('/customers', async (req, res) => {
             return res.status(400).json({ message: 'Customer name is required' });
         }
         
-        const query = `INSERT INTO customers (name, phone) VALUES ($1, $2) RETURNING *`;
+        const query = `INSERT INTO customers (name, phone) VALUES ($1, $2)`;
         const values = [name, phone || null];
         const result = await db.query(query, values);
         
