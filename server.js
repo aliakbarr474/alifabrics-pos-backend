@@ -1393,6 +1393,45 @@ app.post('/customers', async (req, res) => {
   }
 });
 
+app.delete('/inventory/:id', async (req, res) => {
+    const itemId = req.params.id;
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        // Check if item exists in sale_items to prevent foreign key crashes
+        const [salesCheck] = await connection.query(
+            `SELECT COUNT(*) as count FROM sale_items WHERE item_id = ?`,
+            [itemId]
+        );
+
+        if (salesCheck[0].count > 0) {
+            await connection.rollback();
+            return res.status(400).json({ 
+                message: "Cannot delete this product because it has associated sales history. Consider setting stock to 0 instead." 
+            });
+        }
+        
+        await connection.query(`DELETE FROM inventory WHERE item_id = ?`, [itemId]);
+        await connection.query(`DELETE FROM purchase_items WHERE item_id = ?`, [itemId]);
+        const [result] = await connection.query(`DELETE FROM items WHERE id = ?`, [itemId]);
+
+        if (result.affectedRows === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: "Product not found." });
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: "Product deleted successfully." });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ message: error.sqlMessage || error.message });
+    } finally {
+        connection.release();
+    }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
