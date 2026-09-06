@@ -1412,7 +1412,7 @@ app.delete('/inventory/:id', async (req, res) => {
                 message: "Cannot delete this product because it has associated sales history. Consider setting stock to 0 instead." 
             });
         }
-        
+
         await connection.query(`DELETE FROM inventory WHERE item_id = ?`, [itemId]);
         await connection.query(`DELETE FROM purchase_items WHERE item_id = ?`, [itemId]);
         const [result] = await connection.query(`DELETE FROM items WHERE id = ?`, [itemId]);
@@ -1424,6 +1424,72 @@ app.delete('/inventory/:id', async (req, res) => {
 
         await connection.commit();
         res.status(200).json({ message: "Product deleted successfully." });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ message: error.sqlMessage || error.message });
+    } finally {
+        connection.release();
+    }
+});
+
+app.delete('/vendors/:id', async (req, res) => {
+    const vendorId = req.params.id;
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        // Check if vendor has associated purchases
+        const [purchasesCheck] = await connection.query(
+            `SELECT COUNT(*) as count FROM purchases WHERE vendor_id = ?`,
+            [vendorId]
+        );
+
+        if (purchasesCheck[0].count > 0) {
+            await connection.rollback();
+            return res.status(400).json({ 
+                message: "Cannot delete this vendor because they have associated purchase history." 
+            });
+        }
+
+        await connection.query(`DELETE FROM vendor_company_names WHERE vendor_id = ?`, [vendorId]);        
+        await connection.query(`DELETE FROM payments WHERE vendor_id = ?`, [vendorId]);
+        const [result] = await connection.query(`DELETE FROM vendors WHERE id = ?`, [vendorId]);
+
+        if (result.affectedRows === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: "Vendor not found." });
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: "Vendor deleted successfully." });
+    } catch (error) {
+        await connection.rollback();
+        res.status(500).json({ message: error.sqlMessage || error.message });
+    } finally {
+        connection.release();
+    }
+});
+
+app.delete('/customers/:id', async (req, res) => {
+    const customerId = req.params.id;
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        await connection.query(`DELETE FROM customer_payments WHERE customer_id = ?`, [customerId]);
+        await connection.query(`UPDATE sales SET customer_id = NULL WHERE customer_id = ?`, [customerId]);
+
+        const [result] = await connection.query(`DELETE FROM customers WHERE id = ?`, [customerId]);
+
+        if (result.affectedRows === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: "Customer not found." });
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: "Customer deleted successfully." });
     } catch (error) {
         await connection.rollback();
         res.status(500).json({ message: error.sqlMessage || error.message });
