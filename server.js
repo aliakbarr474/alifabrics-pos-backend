@@ -873,15 +873,13 @@ app.get('/api/dashboard/summary', async (req, res) => {
         WHERE b.is_active = TRUE
       `),
       db.query(`
-  SELECT 
-    b.bank_name, 
-    b.account_title,
-    COALESCE((SELECT SUM(amount_paid) FROM sales WHERE bank_account_id = b.id), 0) +
-    COALESCE((SELECT SUM(amount) FROM customer_payments WHERE bank_account_id = b.id), 0) -
-    COALESCE((SELECT SUM(amount) FROM payments WHERE bank_account_id = b.id), 0) AS balance
-  FROM business_bank_accounts b
-  WHERE b.is_active = TRUE
-`)
+        SELECT 
+          bank_name, 
+          account_title,
+          0 AS balance 
+        FROM business_bank_accounts 
+        WHERE is_active = TRUE
+      `)
     ]);
 
     const cash = Number(cashData[0][0].total_cash) || 0;
