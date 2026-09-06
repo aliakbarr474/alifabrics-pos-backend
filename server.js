@@ -1181,12 +1181,11 @@ app.get('/invoices/:id/items', async (req, res) => {
 
 app.post('/return', async (req, res) => {
   const { saleId, customerId, returnItems, totalRefund } = req.body;
-
-  console.log("Incoming return items:", returnItems);
-
-  if (!returnItems || returnItems.some(item => item.itemId == null)) {
+  
+  // 1. Fixed validation to check for 'item.id'
+  if (!returnItems || returnItems.some(item => item.id == null)) {
     return res.status(400).json({ 
-      message: "Invalid payload: 'itemId' is missing in one or more return items." 
+      message: "Invalid payload: 'id' is missing in one or more return items." 
     });
   }
 
@@ -1203,19 +1202,21 @@ app.post('/return', async (req, res) => {
 
     for (const item of returnItems) {
       if (item.quantity > 0) {
+        const itemRefundAmount = item.sellingPrice; 
+
         await connection.query(
           `INSERT INTO return_items (return_id, item_id, quantity, refund_amount) VALUES (?, ?, ?, ?)`,
-          [returnId, item.itemId, item.quantity, item.refundAmount]
+          [returnId, item.id, item.quantity, itemRefundAmount] 
         );
 
         await connection.query(
           `UPDATE items SET stock = stock + ? WHERE id = ?`,
-          [item.quantity, item.itemId]
+          [item.quantity, item.id]
         );
 
         await connection.query(
           `UPDATE inventory SET stock = stock + ? WHERE item_id = ?`,
-          [item.quantity, item.itemId]
+          [item.quantity, item.id] 
         );
       }
     }
