@@ -159,7 +159,7 @@ app.post('/login', async (req, res) => {
     const token = jwt.sign(
       { username: user.username },
       secretKey,
-      { expiresIn: '1h' }
+      { expiresIn: '12h' }
     );
 
     return res.status(200).json({
