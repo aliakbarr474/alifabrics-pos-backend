@@ -32,7 +32,6 @@ module.exports = db;
 db.getConnection()
   .then(connection => {
     console.log("Connected to MySQL database.");
-    // initTables(db);
     connection.release();
   })
   .catch(err => {
@@ -174,121 +173,225 @@ app.post('/login', async (req, res) => {
   }
 });
 
-app.post('/add-product', verifyToken, async (req, res) => {
-  const { vendorName, vendorPhone, items } = req.body;
+const { createHash } = require('crypto');
 
-  const parsedVendorName = typeof vendorName === 'object' && vendorName !== null
-    ? vendorName.contact_person || vendorName.company_name
-    : vendorName;
+const vendorError = (message, status = 400) => Object.assign(new Error(message), { status });
 
-  if (!parsedVendorName) return res.status(400).json({ message: 'Missing: vendorName' });
-  if (!items || items.length === 0) return res.status(400).json({ message: 'Missing: items' });
+const cleanVendorName = (value) => typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
 
-  const connection = await db.getConnection();
+const vendorNameLock = (name) => `pos_vendor_${createHash('sha1').update(name.toLowerCase()).digest('hex')}`;
 
-  try {
-    await connection.beginTransaction();
+const acquireVendorNameLock = async (connection, name) => {
+  const lockName = vendorNameLock(name);
+  const [[result]] = await connection.query('SELECT GET_LOCK(?, 10) AS acquired', [lockName]);
+  if (result.acquired !== 1) throw vendorError('Vendor record is busy. Please try again.', 503);
+  return lockName;
+};
 
-    let finalVendorId;
+const releaseVendorNameLock = async (connection, lockName) => {
+  if (lockName) {
+    try {
+      await connection.query('SELECT RELEASE_LOCK(?)', [lockName]);
+    } catch (error) {
+      console.error('Could not release vendor lock:', error);
+    }
+  }
+};
 
-    const [existingVendor] = await connection.query(
-      'SELECT vendor_id FROM vendor_company_names WHERE company_name = ?',
-      [parsedVendorName]
-    );
+const resolveVendor = async (connection, { vendorId, vendorName, vendorPhone, allowCreate = false }) => {
+  if (vendorId !== undefined && vendorId !== null && vendorId !== '') {
+    const id = Number(vendorId);
+    if (!Number.isSafeInteger(id) || id <= 0) throw vendorError('Invalid vendor ID');
+    const [vendors] = await connection.query('SELECT id FROM vendors WHERE id = ? FOR UPDATE', [id]);
+    if (vendors.length === 0) throw vendorError('Vendor not found', 404);
+    return id;
+  }
 
-    if (existingVendor.length > 0) {
-      finalVendorId = existingVendor[0].vendor_id;
-    } else {
-      const [newVendorResult] = await connection.query(
-        'INSERT INTO vendors (current_balance, contact_person, phone) VALUES (0, ?, ?)',
-        [parsedVendorName, vendorPhone || null]
-      );
-      finalVendorId = newVendorResult.insertId;
+  const name = cleanVendorName(vendorName);
+  if (!name) throw vendorError('Select an existing vendor or enter a vendor name');
 
-      await connection.query(
-        'INSERT INTO vendor_company_names (vendor_id, company_name, is_primary) VALUES (?, ?, TRUE)',
-        [finalVendorId, parsedVendorName]
-      );
+  const [vendors] = await connection.query(
+    `SELECT v.id, v.contact_person, v.phone
+     FROM vendors v
+     WHERE LOWER(TRIM(v.contact_person)) = LOWER(?)
+        OR EXISTS (
+          SELECT 1 FROM vendor_company_names vc
+          WHERE vc.vendor_id = v.id AND LOWER(TRIM(vc.company_name)) = LOWER(?)
+        )
+     ORDER BY v.id FOR UPDATE`,
+    [name, name]
+  );
+
+  if (vendors.length > 1) {
+    throw vendorError(`Multiple vendor accounts match "${name}". Select the vendor by ID or merge confirmed duplicates first.`, 409);
+  }
+
+  if (vendors.length === 1) {
+    const vendor = vendors[0];
+    const requestedPhone = String(vendorPhone || '').replace(/\D/g, '');
+    const existingPhone = String(vendor.phone || '').replace(/\D/g, '');
+    if (requestedPhone && existingPhone && requestedPhone !== existingPhone) {
+      throw vendorError('The vendor name matches an account with a different phone. Select its vendor ID or review the account.', 409);
     }
 
-    for (const item of items) {
-      const { productName, brand, category, unit, quantity, unitPrice, sellingPrice, total } = item;
-
+    const [companyRows] = await connection.query(
+      'SELECT id FROM vendor_company_names WHERE vendor_id = ? LIMIT 1',
+      [vendor.id]
+    );
+    if (companyRows.length === 0) {
       await connection.query(
-        'UPDATE vendors SET current_balance = current_balance + ? WHERE id = ?',
-        [total, finalVendorId]
+        'INSERT INTO vendor_company_names (vendor_id, company_name, is_primary) VALUES (?, ?, TRUE)',
+        [vendor.id, name]
       );
+    }
+    return vendor.id;
+  }
 
-      let actualBrandId = null;
-      if (brand) {
-        const [existingBrand] = await connection.query(
-          'SELECT id FROM brands WHERE name = ?',
-          [brand]
-        );
-        if (existingBrand.length > 0) {
-          actualBrandId = existingBrand[0].id;
+  const requestedPhone = String(vendorPhone || '').replace(/\D/g, '');
+  if (requestedPhone) {
+    const [matchingPhone] = await connection.query(
+      `SELECT id FROM vendors
+       WHERE COALESCE(phone, '') <> ''
+       AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', '') = ?
+       ORDER BY id FOR UPDATE`,
+      [requestedPhone]
+    );
+    if (matchingPhone.length) throw vendorError('A vendor with this phone already exists under another name. Select its existing account.', 409);
+  }
+
+  if (!allowCreate) throw vendorError('Vendor not found. Add it before recording a purchase.', 404);
+
+  const [newVendor] = await connection.query(
+    'INSERT INTO vendors (contact_person, phone, current_balance) VALUES (?, ?, 0)',
+    [name, cleanVendorName(vendorPhone) || null]
+  );
+  await connection.query(
+    'INSERT INTO vendor_company_names (vendor_id, company_name, is_primary) VALUES (?, ?, TRUE)',
+    [newVendor.insertId, name]
+  );
+  return newVendor.insertId;
+};
+
+app.post('/add-product', verifyToken, async (req, res) => {
+  const { vendorName, vendorPhone, items, vendorInvoiceNumber } = req.body;
+  const vendorId = req.body.vendorId ?? req.body.vendor_id ?? (typeof vendorName === 'object' && vendorName !== null ? vendorName.id ?? vendorName.vendor_id : null);
+  const parsedVendorName = typeof vendorName === 'object' && vendorName !== null
+    ? vendorName.company_name || vendorName.contact_person || vendorName.name
+    : vendorName;
+
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ message: 'At least one item is required' });
+  if (!vendorId && !cleanVendorName(parsedVendorName)) return res.status(400).json({ message: 'Select or enter a vendor' });
+
+  const preparedItems = [];
+  for (const item of items) {
+    const quantity = Number(item.quantity);
+    const unitPrice = Number(item.unitPrice);
+    const sellingPrice = Number(item.sellingPrice);
+    const name = typeof item.productName === 'string' ? item.productName.trim() : '';
+    const unit = typeof item.unit === 'string' ? item.unit.trim() : '';
+    const total = Math.round(quantity * unitPrice);
+
+    if (!name || !unit || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0 || !Number.isFinite(sellingPrice) || sellingPrice < 0 || !Number.isSafeInteger(total) || total < 0 || quantity > 99999999 || unitPrice > 99999999 || sellingPrice > 99999999) {
+      return res.status(400).json({ message: 'Invalid product name, quantity, price, or unit' });
+    }
+
+    if (item.total !== undefined && item.total !== null && item.total !== '' && Math.abs(Number(item.total) - total) > 1) {
+      return res.status(400).json({ message: `Purchase total does not match quantity and cost for ${name}` });
+    }
+
+    preparedItems.push({ ...item, productName: name, unit, quantity, unitPrice, sellingPrice, total });
+  }
+
+  const purchaseTotal = preparedItems.reduce((sum, item) => sum + item.total, 0);
+  if (!Number.isSafeInteger(purchaseTotal) || purchaseTotal > 2147483647) return res.status(400).json({ message: 'Purchase total is too large' });
+
+  const connection = await db.getConnection();
+  let lockName = null;
+
+  try {
+    if (!vendorId) lockName = await acquireVendorNameLock(connection, cleanVendorName(parsedVendorName));
+    await connection.beginTransaction();
+
+    const finalVendorId = await resolveVendor(connection, {
+      vendorId,
+      vendorName: parsedVendorName,
+      vendorPhone,
+      allowCreate: true
+    });
+
+    const [purchaseResult] = await connection.query(
+      'INSERT INTO purchases (vendor_id, total_amount, description, vendor_invoice_number) VALUES (?, ?, ?, ?)',
+      [finalVendorId, purchaseTotal, `Purchase of ${preparedItems.length} item(s)`, cleanVendorName(vendorInvoiceNumber) || null]
+    );
+
+    for (const item of preparedItems) {
+      const { productName, brand, category, unit, quantity, unitPrice, sellingPrice, total } = item;
+      let brandId = null;
+      const brandName = cleanVendorName(brand);
+
+      if (brandName) {
+        const [brands] = await connection.query('SELECT id FROM brands WHERE LOWER(TRIM(name)) = LOWER(?) ORDER BY id LIMIT 1', [brandName]);
+        if (brands.length) {
+          brandId = brands[0].id;
         } else {
-          const [newBrandResult] = await connection.query(
-            'INSERT INTO brands (name) VALUES (?)',
-            [brand]
-          );
-          actualBrandId = newBrandResult.insertId;
+          const [newBrand] = await connection.query('INSERT INTO brands (name) VALUES (?)', [brandName]);
+          brandId = newBrand.insertId;
         }
       }
 
-      const [existingItem] = await connection.query(
-        'SELECT id FROM items WHERE name = ? AND vendor_id = ?',
-        [productName, finalVendorId]
-      );
-
-      let itemId;
-
-      if (existingItem.length > 0) {
-        itemId = existingItem[0].id;
-
-        await connection.query(
-          `UPDATE items 
-           SET stock = stock + ?, unit_price = ?, selling_price = ?, total_price = total_price + ?, category = ?, unit = ?, brand_id = ?
-           WHERE id = ?`,
-          [quantity, unitPrice, sellingPrice, total, category, unit, actualBrandId, itemId]
-        );
-
-        await connection.query(
-          'UPDATE inventory SET stock = stock + ? WHERE item_id = ?',
-          [quantity, itemId]
-        );
-
+      let itemId = item.itemId ?? item.id;
+      if (itemId !== undefined && itemId !== null && itemId !== '') {
+        const [found] = await connection.query('SELECT id FROM items WHERE id = ? AND vendor_id = ? FOR UPDATE', [itemId, finalVendorId]);
+        if (!found.length) throw vendorError(`Selected item ${itemId} is not assigned to this vendor`, 409);
+        itemId = found[0].id;
       } else {
-        const [newItemResult] = await connection.query(
-          `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [finalVendorId, actualBrandId, productName, category, quantity, unit, unitPrice, sellingPrice, total]
+        const [matches] = await connection.query(
+          `SELECT id FROM items
+           WHERE vendor_id = ? AND LOWER(TRIM(name)) = LOWER(?)
+             AND brand_id <=> ? AND LOWER(TRIM(unit)) = LOWER(?)
+           ORDER BY id FOR UPDATE`,
+          [finalVendorId, productName, brandId, unit]
         );
-
-        itemId = newItemResult.insertId;
-
-        await connection.query(
-          'INSERT INTO inventory (item_id, stock) VALUES (?, ?)',
-          [itemId, quantity]
-        );
+        if (matches.length > 1) throw vendorError(`Multiple inventory records match ${productName}. Choose the product by item ID.`, 409);
+        itemId = matches.length ? matches[0].id : null;
       }
 
-      const purchaseDescription = `Purchased ${quantity} ${unit} of ${productName}`;
+      if (itemId) {
+        await connection.query(
+          `UPDATE items
+           SET stock = stock + ?, unit_price = ?, selling_price = ?, total_price = total_price + ?, category = ?, unit = ?, brand_id = ?
+           WHERE id = ?`,
+          [quantity, unitPrice, sellingPrice, total, category || null, unit, brandId, itemId]
+        );
+        const [updated] = await connection.query('UPDATE inventory SET stock = stock + ? WHERE item_id = ?', [quantity, itemId]);
+        if (updated.affectedRows === 0) {
+          await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [itemId, quantity]);
+        }
+      } else {
+        const [newItem] = await connection.query(
+          `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [finalVendorId, brandId, productName, category || null, quantity, unit, unitPrice, sellingPrice, total]
+        );
+        itemId = newItem.insertId;
+        await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [itemId, quantity]);
+      }
+
       await connection.query(
-        'INSERT INTO purchases (vendor_id, total_amount, description) VALUES (?, ?, ?)',
-        [finalVendorId, total, purchaseDescription]
+        'INSERT INTO purchase_items (purchase_id, item_id, quantity, unit_cost) VALUES (?, ?, ?, ?)',
+        [purchaseResult.insertId, itemId, quantity, unitPrice]
       );
     }
 
+    await connection.query('UPDATE vendors SET current_balance = current_balance + ? WHERE id = ?', [purchaseTotal, finalVendorId]);
     await connection.commit();
-
-    return res.status(200).json({ message: 'Data saved successfully!' });
-
+    return res.status(200).json({ message: 'Purchase saved successfully', vendorId: finalVendorId, purchaseId: purchaseResult.insertId });
   } catch (error) {
     await connection.rollback();
-    console.error("ADD PRODUCT ERROR:", error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    console.error('ADD PRODUCT ERROR:', error);
+    return res.status(error.status || 500).json({ message: error.status ? error.message : 'Could not save purchase' });
   } finally {
+    await releaseVendorNameLock(connection, lockName);
     connection.release();
   }
 });
@@ -460,18 +563,13 @@ app.get('/customers/:id/history', verifyToken, async (req, res) => {
 
 app.get('/vendors', verifyToken, async (req, res) => {
   try {
-    const query = `
-      SELECT 
-        v.id, 
-        v.contact_person, 
-        vc.company_name 
-      FROM vendors v
-      LEFT JOIN vendor_company_names vc ON v.id = vc.vendor_id AND vc.is_primary = TRUE
-      ORDER BY v.created_at DESC
-    `;
-    const [vendors] = await db.query(query);
+    const [vendors] = await db.query(
+      `SELECT v.id, v.contact_person, v.phone, v.current_balance,
+         COALESCE((SELECT company_name FROM vendor_company_names
+           WHERE vendor_id = v.id ORDER BY is_primary DESC, id ASC LIMIT 1), v.contact_person) AS company_name
+       FROM vendors v ORDER BY v.created_at DESC, v.id DESC`
+    );
     return res.status(200).json(vendors);
-
   } catch (error) {
     console.error('Database Error during /vendors fetch:', error);
     return res.status(500).json({ message: 'Failed to fetch vendors' });
@@ -488,7 +586,7 @@ app.get('/inventory/:id/history', verifyToken, async (req, res) => {
         s.id AS receipt_no,
         si.meters_sold, 
         si.unit_price, 
-        si.subtotal  -- Now pulling directly from the generated column
+        si.subtotal
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.id
       WHERE si.item_id = ?
@@ -506,118 +604,180 @@ app.get('/inventory/:id/history', verifyToken, async (req, res) => {
 
 app.post('/add-vendors', verifyToken, async (req, res) => {
   const { vendorName, contact, balance } = req.body;
+  const name = cleanVendorName(vendorName);
+  const phone = cleanVendorName(contact);
+  const openingBalance = Number(balance ?? 0);
+
+  if (!name || !phone || !Number.isSafeInteger(openingBalance) || Math.abs(openingBalance) > 2147483647) {
+    return res.status(400).json({ message: 'Provide a vendor name, phone, and valid whole-rupee balance' });
+  }
+
+  const connection = await db.getConnection();
+  let lockName = null;
 
   try {
-    const insertVendorQuery = `
-    INSERT INTO vendors (contact_person, phone, current_balance) 
-    VALUES (?,?,?)`
+    lockName = await acquireVendorNameLock(connection, name);
+    await connection.beginTransaction();
 
-    await db.query(insertVendorQuery, [vendorName, contact, balance]);
-    return res.status(200).json({ message: 'Vendor Entry Successful' });
+    const [existing] = await connection.query(
+      `SELECT v.id FROM vendors v
+       WHERE LOWER(TRIM(v.contact_person)) = LOWER(?)
+          OR EXISTS (SELECT 1 FROM vendor_company_names vc
+                     WHERE vc.vendor_id = v.id AND LOWER(TRIM(vc.company_name)) = LOWER(?))
+       ORDER BY v.id FOR UPDATE`,
+      [name, name]
+    );
+
+    if (existing.length) throw vendorError('This vendor already exists. Select its existing account instead.', 409);
+
+    const [matchingPhones] = await connection.query(
+      `SELECT id, contact_person FROM vendors
+       WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(phone, ''), ' ', ''), '-', ''), '+', ''), '(', ''), ')', '') = ?
+       AND COALESCE(phone, '') <> '' ORDER BY id FOR UPDATE`,
+      [phone.replace(/\D/g, '')]
+    );
+    if (matchingPhones.length) throw vendorError('A vendor with this phone already exists. Review the existing account before creating another.', 409);
+
+    const [result] = await connection.query(
+      'INSERT INTO vendors (contact_person, phone, current_balance) VALUES (?, ?, ?)',
+      [name, phone, openingBalance]
+    );
+    await connection.query(
+      'INSERT INTO vendor_company_names (vendor_id, company_name, is_primary) VALUES (?, ?, TRUE)',
+      [result.insertId, name]
+    );
+
+    await connection.commit();
+    return res.status(201).json({ message: 'Vendor added successfully', vendorId: result.insertId });
   } catch (error) {
-    console.log(`Couldn't add vendors: `, error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    await connection.rollback();
+    console.error('Could not add vendor:', error);
+    return res.status(error.status || 500).json({ message: error.status ? error.message : 'Unable to add vendor' });
+  } finally {
+    await releaseVendorNameLock(connection, lockName);
+    connection.release();
   }
 });
 
 app.get('/get-vendors', verifyToken, async (req, res) => {
   try {
-    const getVendorQuery =
-      `SELECT id, contact_person, phone, current_balance FROM vendors ORDER BY created_at ASC`
-
-    const [record] = await db.query(getVendorQuery);
-    return res.status(200).json(record);
+    const [records] = await db.query(
+      `SELECT v.id, v.contact_person, v.phone, v.current_balance,
+         COALESCE((SELECT company_name FROM vendor_company_names
+           WHERE vendor_id = v.id ORDER BY is_primary DESC, id ASC LIMIT 1), v.contact_person) AS company_name
+       FROM vendors v ORDER BY v.created_at ASC, v.id ASC`
+    );
+    return res.status(200).json(records);
   } catch (error) {
-    console.log('Error occured while fetching vendors: ', error);
+    console.error('Error retrieving vendors:', error);
     return res.status(500).json({ message: 'Failed to fetch vendors' });
   }
 });
 
 app.get('/vendors/:vendorName/brands', verifyToken, async (req, res) => {
-  const vendorName = req.params.vendorName;
   const connection = await db.getConnection();
-
   try {
-    const [vendor] = await connection.query(
-      'SELECT vendor_id FROM vendor_company_names WHERE company_name = ?',
-      [vendorName]
-    );
-
-    if (vendor.length === 0) return res.status(200).json([]);
-
-    const vendorId = vendor[0].vendor_id;
-
+    const vendorIdValue = Number(req.params.vendorName);
+    let vendorId;
+    if (Number.isSafeInteger(vendorIdValue) && vendorIdValue > 0) {
+      const [vendorRows] = await connection.query('SELECT id FROM vendors WHERE id = ?', [vendorIdValue]);
+      vendorId = vendorRows.length ? vendorRows[0].id : null;
+    } else {
+      const [vendorRows] = await connection.query(
+        `SELECT v.id FROM vendors v
+         WHERE LOWER(TRIM(v.contact_person)) = LOWER(TRIM(?))
+            OR EXISTS (SELECT 1 FROM vendor_company_names vc
+              WHERE vc.vendor_id = v.id AND LOWER(TRIM(vc.company_name)) = LOWER(TRIM(?)))
+         ORDER BY v.id`,
+        [req.params.vendorName, req.params.vendorName]
+      );
+      if (vendorRows.length > 1) return res.status(409).json({ message: 'Multiple vendors have this name. Select the vendor by ID.' });
+      vendorId = vendorRows.length ? vendorRows[0].id : null;
+    }
+    if (!vendorId) return res.status(200).json([]);
     const [brands] = await connection.query(
-      `SELECT DISTINCT b.id, b.name 
-             FROM brands b
-             JOIN items i ON b.id = i.brand_id
-             WHERE i.vendor_id = ?`,
+      `SELECT DISTINCT b.id, b.name FROM brands b
+       JOIN items i ON b.id = i.brand_id WHERE i.vendor_id = ?`,
       [vendorId]
     );
-
     return res.status(200).json(brands);
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    return res.status(error.status || 500).json({ message: error.status ? error.message : 'Failed to fetch vendor brands' });
   } finally {
     connection.release();
   }
 });
 
 app.get('/vendors/:id/details', verifyToken, async (req, res) => {
-  const vendorId = req.params.id;
+  const vendorId = Number(req.params.id);
+  if (!Number.isSafeInteger(vendorId) || vendorId <= 0) return res.status(400).json({ message: 'Invalid vendor ID' });
 
   try {
-    const [brandsData] = await db.query(
-      `SELECT DISTINCT b.name 
-             FROM brands b
-             JOIN items i ON b.id = i.brand_id
-             WHERE i.vendor_id = ?`,
+    const [vendor] = await db.query('SELECT current_balance FROM vendors WHERE id = ?', [vendorId]);
+    if (!vendor.length) return res.status(404).json({ message: 'Vendor not found' });
+
+    const [brandRows] = await db.query(
+      `SELECT DISTINCT b.name FROM brands b
+       JOIN items i ON b.id = i.brand_id WHERE i.vendor_id = ? ORDER BY b.name`,
       [vendorId]
     );
-
-    const brands = brandsData.map(b => b.name);
 
     const [purchases] = await db.query(
-      `SELECT name AS product_name, stock, unit, total_price 
-             FROM items 
-             WHERE vendor_id = ?`,
+      `SELECT p.id AS purchase_id, p.purchase_date,
+          COALESCE(i.name, p.description) AS product_name,
+          pi.quantity AS stock, COALESCE(i.unit, '') AS unit,
+          COALESCE(ROUND(pi.subtotal), p.total_amount) AS total_price, p.description
+       FROM purchases p
+       LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+       LEFT JOIN items i ON i.id = pi.item_id
+       WHERE p.vendor_id = ?
+       ORDER BY p.purchase_date DESC, p.id DESC, pi.id DESC`,
       [vendorId]
     );
 
-    return res.status(200).json({ brands, purchases });
-
+    return res.status(200).json({ brands: brandRows.map(row => row.name), purchases, currentBalance: vendor[0].current_balance });
   } catch (error) {
-    console.error("Failed to fetch vendor details:", error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    console.error('Failed to fetch vendor details:', error);
+    return res.status(500).json({ message: 'Failed to fetch vendor details' });
   }
 });
 
 app.post('/add-payment', verifyToken, async (req, res) => {
-  const { amount, method, vendor_id, description } = req.body;
+  const { amount, method, vendor_id, description, bankAccountId, bank_account_id } = req.body;
+  const id = Number(vendor_id);
+  const paymentAmount = Number(amount);
+  const bankId = bankAccountId ?? bank_account_id ?? null;
+  if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(paymentAmount) || paymentAmount <= 0 || paymentAmount > 2147483647 || typeof method !== 'string' || !method.trim()) {
+    return res.status(400).json({ message: 'Valid vendor, payment amount, and method are required' });
+  }
+  if (bankId !== null && (!Number.isSafeInteger(Number(bankId)) || Number(bankId) <= 0)) {
+    return res.status(400).json({ message: 'Invalid bank account' });
+  }
   const connection = await db.getConnection();
 
   try {
     await connection.beginTransaction();
 
+    const [existing] = await connection.query('SELECT id FROM vendors WHERE id = ? FOR UPDATE', [id]);
+    if (!existing.length) throw vendorError('Vendor not found', 404);
     const insertPaymentQuery = `
-    INSERT INTO payments (vendor_id, amount, method, description) 
-    VALUES (?,?,?,?)`;
-    await connection.query(insertPaymentQuery, [vendor_id, amount, method, description]);
+    INSERT INTO payments (vendor_id, amount, method, description, bank_account_id)
+    VALUES (?,?,?,?,?)`;
+    await connection.query(insertPaymentQuery, [id, paymentAmount, method.trim(), description || null, bankId ? Number(bankId) : null]);
 
     const updateBalanceQuery = `
     UPDATE vendors SET current_balance = current_balance - ? WHERE id = ?`;
-    await connection.query(updateBalanceQuery, [amount, vendor_id]);
+    await connection.query(updateBalanceQuery, [paymentAmount, id]);
 
     await connection.commit();
 
     try {
-      const [vendorRows] = await connection.query(`SELECT contact_person, phone FROM vendors WHERE id = ?`, [vendor_id]);
+      const [vendorRows] = await connection.query(`SELECT contact_person, phone FROM vendors WHERE id = ?`, [id]);
 
       if (vendorRows.length > 0 && vendorRows[0].phone) {
         const cleanPhone = vendorRows[0].phone.replace(/\D/g, '');
         const vendorName = vendorRows[0].contact_person || 'Vendor';
-        const messageText = `Hello *${vendorName}*,\n\nWe have successfully processed a payment of *${Number(amount).toLocaleString()} PKR* via ${method}.\n\nThank you!`;
+        const messageText = `Hello *${vendorName}*,\n\nWe have successfully processed a payment of *${paymentAmount.toLocaleString()} PKR* via ${method}.\n\nThank you!`;
 
         if (whatsappClient.info) {
           const numberDetails = await whatsappClient.getNumberId(cleanPhone);
@@ -636,7 +796,7 @@ app.post('/add-payment', verifyToken, async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.log(`Couldn't add payment: `, error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    return res.status(error.status || 500).json({ message: error.status ? error.message : 'Internal Server Error' });
   } finally {
     connection.release();
   }
@@ -646,7 +806,7 @@ app.get('/get-payments', verifyToken, async (req, res) => {
   try {
     const getPayments = `
       SELECT
-        v.contact_person AS vendor_name,
+        COALESCE((SELECT company_name FROM vendor_company_names WHERE vendor_id = v.id ORDER BY is_primary DESC, id LIMIT 1), v.contact_person) AS vendor_name,
         p.amount,
         p.method,
         p.description,
@@ -669,43 +829,39 @@ app.get('/get-payments', verifyToken, async (req, res) => {
 });
 
 app.get('/vendors/:id/ledger', verifyToken, async (req, res) => {
-  const vendorId = req.params.id;
+  const vendorId = Number(req.params.id);
+  if (!Number.isSafeInteger(vendorId) || vendorId <= 0) return res.status(400).json({ message: 'Invalid vendor ID' });
 
   try {
-    const query = `
-            SELECT 
-                purchase_date AS transaction_date, 
-                'Purchase Bill' AS type, 
-                description, 
-                0 AS debit_paid, 
-                total_amount AS credit_owed
-            FROM purchases 
-            WHERE vendor_id = ? 
-            
-            UNION ALL
-            
-            SELECT 
-                payment_date AS transaction_date, 
-                CONCAT('Payment - ', method) AS type, 
-                description, 
-                amount AS debit_paid, 
-                0 AS credit_owed
-            FROM payments 
-            WHERE vendor_id = ? 
-            
-            ORDER BY transaction_date ASC;
-        `;
+    const [accounts] = await db.query(
+      `SELECT v.current_balance, v.created_at,
+          COALESCE((SELECT SUM(total_amount) FROM purchases WHERE vendor_id = v.id), 0) AS total_purchases,
+          COALESCE((SELECT SUM(amount) FROM payments WHERE vendor_id = v.id), 0) AS total_payments
+       FROM vendors v WHERE v.id = ?`,
+      [vendorId]
+    );
+    if (!accounts.length) return res.status(404).json({ message: 'Vendor not found' });
 
-    const [ledgerData] = await db.query(query, [vendorId, vendorId]);
+    const [ledgerData] = await db.query(
+      `SELECT purchase_date AS transaction_date, 'Purchase Bill' AS type,
+              description, 0 AS debit_paid, total_amount AS credit_owed,
+              id AS transaction_id, 0 AS sequence
+       FROM purchases WHERE vendor_id = ?
+       UNION ALL
+       SELECT payment_date AS transaction_date, CONCAT('Payment - ', method) AS type,
+              description, amount AS debit_paid, 0 AS credit_owed,
+              id AS transaction_id, 1 AS sequence
+       FROM payments WHERE vendor_id = ?
+       ORDER BY transaction_date ASC, sequence ASC, transaction_id ASC`,
+      [vendorId, vendorId]
+    );
 
-    return res.status(200).json({
-      success: true,
-      data: ledgerData
-    });
-
+    const account = accounts[0];
+    const openingBalance = Number(account.current_balance) - Number(account.total_purchases) + Number(account.total_payments);
+    return res.status(200).json({ success: true, data: ledgerData, openingBalance, createdAt: account.created_at });
   } catch (error) {
-    console.error("Failed to fetch ledger details:", error);
-    return res.status(500).json({ message: 'Internal Server Error' });
+    console.error('Failed to fetch ledger details:', error);
+    return res.status(500).json({ message: 'Failed to fetch ledger details' });
   }
 });
 
@@ -875,7 +1031,7 @@ app.get('/api/dashboard/summary', verifyToken, async (req, res) => {
       `),
       db.query(`
         SELECT p.id, p.amount, p.method, p.payment_date, 
-          COALESCE((SELECT company_name FROM vendor_company_names WHERE vendor_id = p.vendor_id LIMIT 1), 'Vendor') as vendor_name
+          COALESCE((SELECT company_name FROM vendor_company_names WHERE vendor_id = p.vendor_id ORDER BY is_primary DESC, id LIMIT 1), (SELECT contact_person FROM vendors WHERE id = p.vendor_id), 'Vendor') as vendor_name
         FROM payments p
         ORDER BY p.payment_date DESC 
         LIMIT 5
@@ -1058,7 +1214,7 @@ app.get('/api/backup', verifyToken, async (req, res) => {
                 FROM items i
                 LEFT JOIN brands b ON i.brand_id = b.id
                 LEFT JOIN vendors v ON i.vendor_id = v.id
-                LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
+                LEFT JOIN vendor_company_names vcn ON vcn.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = v.id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
             `;
       break;
 
@@ -1073,7 +1229,7 @@ app.get('/api/backup', verifyToken, async (req, res) => {
                     p.payment_date 
                 FROM payments p
                 LEFT JOIN vendors v ON p.vendor_id = v.id
-                LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
+                LEFT JOIN vendor_company_names vcn ON vcn.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = v.id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
             `;
       break;
 
@@ -1087,7 +1243,7 @@ app.get('/api/backup', verifyToken, async (req, res) => {
                     p.purchase_date 
                 FROM purchases p
                 LEFT JOIN vendors v ON p.vendor_id = v.id
-                LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
+                LEFT JOIN vendor_company_names vcn ON vcn.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = v.id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
             `;
       break;
 
@@ -1101,7 +1257,7 @@ app.get('/api/backup', verifyToken, async (req, res) => {
                     v.current_balance, 
                     v.created_at 
                 FROM vendors v
-                LEFT JOIN vendor_company_names vcn ON v.id = vcn.vendor_id AND vcn.is_primary = TRUE
+                LEFT JOIN vendor_company_names vcn ON vcn.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = v.id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
             `;
       break;
 
@@ -1261,7 +1417,7 @@ app.get('/inventory', verifyToken, async (req, res) => {
       SELECT 
         i.id, 
         i.name AS productName, 
-        vc.company_name AS vendorName,
+        COALESCE(vc.company_name, v.contact_person) AS vendorName,
         b.name AS brandName, 
         i.category, 
         i.stock, 
@@ -1269,7 +1425,8 @@ app.get('/inventory', verifyToken, async (req, res) => {
         i.unit_price AS unitPrice,
         i.selling_price AS sellingPrice
       FROM items i
-      LEFT JOIN vendor_company_names vc ON i.vendor_id = vc.vendor_id AND vc.is_primary = TRUE
+      LEFT JOIN vendors v ON i.vendor_id = v.id
+      LEFT JOIN vendor_company_names vc ON vc.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = i.vendor_id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
       LEFT JOIN brands b ON i.brand_id = b.id
       ORDER BY i.created_at DESC
     `;
@@ -1341,52 +1498,63 @@ app.get('/api/bank-accounts/active', verifyToken, async (req, res) => {
 });
 
 app.post('/add-single-product', verifyToken, async (req, res) => {
-  try {
-    const { items } = req.body;
+  const { items, vendorName, vendorPhone } = req.body;
+  const vendorId = req.body.vendorId ?? req.body.vendor_id ?? (typeof vendorName === 'object' && vendorName !== null ? vendorName.id ?? vendorName.vendor_id : null);
+  const parsedName = typeof vendorName === 'object' && vendorName !== null
+    ? vendorName.company_name || vendorName.contact_person || vendorName.name
+    : vendorName;
 
-    const [vendors] = await db.query(`SELECT id FROM vendors LIMIT 1`);
-    if (vendors.length === 0) {
-      return res.status(400).json({ message: 'A vendor must exist in the database to add a product.' });
-    }
-    const defaultVendorId = vendors[0].id;
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ message: 'At least one product is required' });
+  if (!vendorId && !cleanVendorName(parsedName)) return res.status(400).json({ message: 'Select the vendor for this product' });
+
+  const connection = await db.getConnection();
+  let lockName = null;
+
+  try {
+    if (!vendorId) lockName = await acquireVendorNameLock(connection, cleanVendorName(parsedName));
+    await connection.beginTransaction();
+    const finalVendorId = await resolveVendor(connection, { vendorId, vendorName: parsedName, vendorPhone, allowCreate: false });
 
     for (const item of items) {
+      const name = cleanVendorName(item.productName);
+      const unit = cleanVendorName(item.unit);
+      const brandName = cleanVendorName(item.brand);
+      const quantity = Number(item.quantity);
+      const unitPrice = Number(item.unitPrice);
+      const sellingPrice = Number(item.sellingPrice);
+      const total = Math.round(quantity * unitPrice);
+      if (!name || !unit || !Number.isFinite(quantity) || quantity < 0 || quantity > 99999999 || !Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > 99999999 || !Number.isFinite(sellingPrice) || sellingPrice < 0 || sellingPrice > 99999999 || !Number.isSafeInteger(total) || total > 2147483647) {
+        throw vendorError('Invalid product details');
+      }
+
       let brandId = null;
-      if (item.brand) {
-        const [existingBrand] = await db.query(`SELECT id FROM brands WHERE name = ?`, [item.brand]);
-        if (existingBrand.length > 0) {
-          brandId = existingBrand[0].id;
+      if (brandName) {
+        const [brands] = await connection.query('SELECT id FROM brands WHERE LOWER(TRIM(name)) = LOWER(?) ORDER BY id LIMIT 1', [brandName]);
+        if (brands.length) {
+          brandId = brands[0].id;
         } else {
-          const [newBrand] = await db.query(`INSERT INTO brands (name) VALUES (?)`, [item.brand]);
-          brandId = newBrand.insertId;
+          const [created] = await connection.query('INSERT INTO brands (name) VALUES (?)', [brandName]);
+          brandId = created.insertId;
         }
       }
 
-      const [newItem] = await db.query(
-        `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          defaultVendorId,
-          brandId,
-          item.productName,
-          item.category,
-          item.quantity,
-          item.unit,
-          item.unitPrice,
-          item.sellingPrice,
-          item.total
-        ]
+      const [created] = await connection.query(
+        `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [finalVendorId, brandId, name, item.category || null, quantity, unit, unitPrice, sellingPrice, total]
       );
-
-      await db.query(
-        `INSERT INTO inventory (item_id, stock) VALUES (?, ?)`,
-        [newItem.insertId, item.quantity]
-      );
+      await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [created.insertId, quantity]);
     }
 
-    res.status(200).json({ message: 'Products added successfully' });
+    await connection.commit();
+    return res.status(200).json({ message: 'Products added successfully', vendorId: finalVendorId });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    await connection.rollback();
+    console.error('Unable to add product:', error);
+    return res.status(error.status || 500).json({ message: error.status ? error.message : 'Failed to add products' });
+  } finally {
+    await releaseVendorNameLock(connection, lockName);
+    connection.release();
   }
 });
 
@@ -1411,80 +1579,120 @@ app.post('/customers', verifyToken, async (req, res) => {
   }
 });
 
-app.delete('/inventory/:id', verifyToken, async (req, res) => {
-    const itemId = req.params.id;
-    const connection = await db.getConnection();
+app.put('/inventory/:id', verifyToken, async (req, res) => {
+  const itemId = Number(req.params.id);
+  if (!Number.isSafeInteger(itemId) || itemId <= 0) {
+    return res.status(400).json({ message: 'Invalid item ID' });
+  }
 
-    try {
-        await connection.beginTransaction();
+  const { productName, unitPrice, sellingPrice } = req.body;
+  const name = typeof productName === 'string' ? productName.trim() : '';
+  const isValidPrice = (value) =>
+    (typeof value === 'number' || typeof value === 'string') &&
+    /^\d+(?:\.\d{1,2})?$/.test(String(value)) &&
+    Number.isFinite(Number(value)) && Number(value) <= 99999999.99;
 
-        const [salesCheck] = await connection.query(
-            `SELECT COUNT(*) as count FROM sale_items WHERE item_id = ?`,
-            [itemId]
-        );
+  if (!name || name.length > 255 || !isValidPrice(unitPrice) || !isValidPrice(sellingPrice)) {
+    return res.status(400).json({ message: 'Provide a product name and valid non-negative prices (up to 2 decimal places)' });
+  }
 
-        if (salesCheck[0].count > 0) {
-            await connection.rollback();
-            return res.status(400).json({ 
-                message: "Cannot delete this product because it has associated sales history. Consider setting stock to 0 instead." 
-            });
-        }
+  try {
+    const [existing] = await db.query('SELECT id, name, vendor_id, brand_id, unit FROM items WHERE id = ?', [itemId]);
+    if (!existing.length) return res.status(404).json({ message: 'Product not found' });
 
-        await connection.query(`DELETE FROM inventory WHERE item_id = ?`, [itemId]);
-        await connection.query(`DELETE FROM purchase_items WHERE item_id = ?`, [itemId]);
-        const [result] = await connection.query(`DELETE FROM items WHERE id = ?`, [itemId]);
-
-        if (result.affectedRows === 0) {
-            await connection.rollback();
-            return res.status(404).json({ message: "Product not found." });
-        }
-
-        await connection.commit();
-        res.status(200).json({ message: "Product deleted successfully." });
-    } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ message: error.sqlMessage || error.message });
-    } finally {
-        connection.release();
+    if (name.toLowerCase() !== existing[0].name.trim().toLowerCase()) {
+      const [duplicates] = await db.query(
+        `SELECT id FROM items
+         WHERE id <> ? AND vendor_id = ? AND LOWER(TRIM(name)) = LOWER(?)
+           AND brand_id <=> ? AND LOWER(TRIM(unit)) = LOWER(?) LIMIT 1`,
+        [itemId, existing[0].vendor_id, name, existing[0].brand_id, existing[0].unit]
+      );
+      if (duplicates.length) {
+        return res.status(409).json({ message: 'A product with this name, brand, and unit already exists for this vendor' });
+      }
     }
+
+    await db.query(
+      'UPDATE items SET name = ?, unit_price = ?, selling_price = ? WHERE id = ?',
+      [name, Number(unitPrice), Number(sellingPrice), itemId]
+    );
+
+    return res.status(200).json({
+      message: 'Product updated successfully',
+      product: { id: itemId, productName: name, unitPrice: Number(unitPrice), sellingPrice: Number(sellingPrice) }
+    });
+  } catch (error) {
+    console.error('Error updating inventory product:', error);
+    return res.status(500).json({ message: 'Unable to update product' });
+  }
+});
+
+app.delete('/inventory/:id', verifyToken, async (req, res) => {
+  const itemId = Number(req.params.id);
+  if (!Number.isSafeInteger(itemId) || itemId <= 0) return res.status(400).json({ message: 'Invalid item ID' });
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [records] = await connection.query('SELECT id FROM items WHERE id = ? FOR UPDATE', [itemId]);
+    if (!records.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    const [related] = await connection.query(
+      `SELECT
+        (SELECT COUNT(*) FROM sale_items WHERE item_id = ?) AS sales,
+        (SELECT COUNT(*) FROM purchase_items WHERE item_id = ?) AS purchases,
+        (SELECT COUNT(*) FROM return_items WHERE item_id = ?) AS returns_count`,
+      [itemId, itemId, itemId]
+    );
+    if (Number(related[0].sales) || Number(related[0].purchases) || Number(related[0].returns_count)) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'Cannot delete a product with purchase, sale, or return history. Set its stock to zero instead.' });
+    }
+    await connection.query('DELETE FROM inventory WHERE item_id = ?', [itemId]);
+    await connection.query('DELETE FROM items WHERE id = ?', [itemId]);
+    await connection.commit();
+    return res.status(200).json({ message: 'Product deleted successfully' });
+  } catch (error) {
+    await connection.rollback();
+    return res.status(500).json({ message: error.sqlMessage || 'Unable to delete product' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.delete('/vendors/:id', verifyToken, async (req, res) => {
-    const vendorId = req.params.id;
-    const connection = await db.getConnection();
-
-    try {
-        await connection.beginTransaction();
-
-        const [purchasesCheck] = await connection.query(
-            `SELECT COUNT(*) as count FROM purchases WHERE vendor_id = ?`,
-            [vendorId]
-        );
-
-        if (purchasesCheck[0].count > 0) {
-            await connection.rollback();
-            return res.status(400).json({ 
-                message: "Cannot delete this vendor because they have associated purchase history." 
-            });
-        }
-
-        await connection.query(`DELETE FROM vendor_company_names WHERE vendor_id = ?`, [vendorId]);        
-        await connection.query(`DELETE FROM payments WHERE vendor_id = ?`, [vendorId]);
-        const [result] = await connection.query(`DELETE FROM vendors WHERE id = ?`, [vendorId]);
-
-        if (result.affectedRows === 0) {
-            await connection.rollback();
-            return res.status(404).json({ message: "Vendor not found." });
-        }
-
-        await connection.commit();
-        res.status(200).json({ message: "Vendor deleted successfully." });
-    } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ message: error.sqlMessage || error.message });
-    } finally {
-        connection.release();
+  const vendorId = Number(req.params.id);
+  if (!Number.isSafeInteger(vendorId) || vendorId <= 0) return res.status(400).json({ message: 'Invalid vendor ID' });
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [vendors] = await connection.query('SELECT id, current_balance FROM vendors WHERE id = ? FOR UPDATE', [vendorId]);
+    if (!vendors.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Vendor not found' });
     }
+    const [related] = await connection.query(
+      `SELECT
+        (SELECT COUNT(*) FROM purchases WHERE vendor_id = ?) AS purchases,
+        (SELECT COUNT(*) FROM payments WHERE vendor_id = ?) AS payments,
+        (SELECT COUNT(*) FROM items WHERE vendor_id = ?) AS items`,
+      [vendorId, vendorId, vendorId]
+    );
+    if (Number(related[0].purchases) || Number(related[0].payments) || Number(related[0].items) || Number(vendors[0].current_balance) !== 0) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'Cannot delete a vendor with a balance, products, purchases, or payment history.' });
+    }
+    await connection.query('DELETE FROM vendor_company_names WHERE vendor_id = ?', [vendorId]);
+    await connection.query('DELETE FROM vendors WHERE id = ?', [vendorId]);
+    await connection.commit();
+    return res.status(200).json({ message: 'Vendor deleted successfully' });
+  } catch (error) {
+    await connection.rollback();
+    return res.status(500).json({ message: error.sqlMessage || 'Unable to delete vendor' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.delete('/customers/:id', verifyToken, async (req, res) => {
