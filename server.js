@@ -1428,6 +1428,7 @@ app.get('/inventory', verifyToken, async (req, res) => {
       LEFT JOIN vendors v ON i.vendor_id = v.id
       LEFT JOIN vendor_company_names vc ON vc.id = (SELECT vc2.id FROM vendor_company_names vc2 WHERE vc2.vendor_id = i.vendor_id ORDER BY vc2.is_primary DESC, vc2.id ASC LIMIT 1)
       LEFT JOIN brands b ON i.brand_id = b.id
+      WHERE EXISTS (SELECT 1 FROM inventory inv WHERE inv.item_id = i.id)
       ORDER BY i.created_at DESC
     `;
 
@@ -1514,6 +1515,8 @@ app.post('/add-single-product', verifyToken, async (req, res) => {
     if (!vendorId) lockName = await acquireVendorNameLock(connection, cleanVendorName(parsedName));
     await connection.beginTransaction();
     const finalVendorId = await resolveVendor(connection, { vendorId, vendorName: parsedName, vendorPhone, allowCreate: false });
+    let addedCount = 0;
+    let updatedCount = 0;
 
     for (const item of items) {
       const name = cleanVendorName(item.productName);
@@ -1538,16 +1541,44 @@ app.post('/add-single-product', verifyToken, async (req, res) => {
         }
       }
 
-      const [created] = await connection.query(
-        `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [finalVendorId, brandId, name, item.category || null, quantity, unit, unitPrice, sellingPrice, total]
+      const [matches] = await connection.query(
+        `SELECT id FROM items
+         WHERE vendor_id = ? AND LOWER(TRIM(name)) = LOWER(?)
+           AND brand_id <=> ? AND LOWER(TRIM(unit)) = LOWER(?)
+         ORDER BY id FOR UPDATE`,
+        [finalVendorId, name, brandId, unit]
       );
-      await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [created.insertId, quantity]);
+      if (matches.length > 1) throw vendorError(`Multiple inventory records match ${name}. Update the product from its record instead.`, 409);
+
+      if (matches.length) {
+        const itemId = matches[0].id;
+        await connection.query(
+          `UPDATE items
+           SET stock = stock + ?, unit_price = ?, selling_price = ?, total_price = total_price + ?, category = ?, unit = ?
+           WHERE id = ?`,
+          [quantity, unitPrice, sellingPrice, total, item.category || null, unit, itemId]
+        );
+        const [updated] = await connection.query('UPDATE inventory SET stock = stock + ? WHERE item_id = ?', [quantity, itemId]);
+        if (updated.affectedRows === 0) {
+          await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [itemId, quantity]);
+        }
+        updatedCount += 1;
+      } else {
+        const [created] = await connection.query(
+          `INSERT INTO items (vendor_id, brand_id, name, category, stock, unit, unit_price, selling_price, total_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [finalVendorId, brandId, name, item.category || null, quantity, unit, unitPrice, sellingPrice, total]
+        );
+        await connection.query('INSERT INTO inventory (item_id, stock) VALUES (?, ?)', [created.insertId, quantity]);
+        addedCount += 1;
+      }
     }
 
     await connection.commit();
-    return res.status(200).json({ message: 'Products added successfully', vendorId: finalVendorId });
+    const message = updatedCount
+      ? `${addedCount} new product(s) added, ${updatedCount} existing product(s) restocked`
+      : 'Products added successfully';
+    return res.status(200).json({ message, vendorId: finalVendorId, addedCount, updatedCount });
   } catch (error) {
     await connection.rollback();
     console.error('Unable to add product:', error);
@@ -1646,8 +1677,10 @@ app.delete('/inventory/:id', verifyToken, async (req, res) => {
       [itemId, itemId, itemId]
     );
     if (Number(related[0].sales) || Number(related[0].purchases) || Number(related[0].returns_count)) {
-      await connection.rollback();
-      return res.status(409).json({ message: 'Cannot delete a product with purchase, sale, or return history. Set its stock to zero instead.' });
+      await connection.query('UPDATE items SET stock = 0 WHERE id = ?', [itemId]);
+      await connection.query('DELETE FROM inventory WHERE item_id = ?', [itemId]);
+      await connection.commit();
+      return res.status(200).json({ message: 'Product removed from inventory. Its sales and purchase history has been kept.', archived: true });
     }
     await connection.query('DELETE FROM inventory WHERE item_id = ?', [itemId]);
     await connection.query('DELETE FROM items WHERE id = ?', [itemId]);
